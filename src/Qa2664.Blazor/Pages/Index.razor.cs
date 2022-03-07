@@ -44,7 +44,8 @@ public partial class Index
             }
 
             await AuthenticationStateProvider.SetTokenAsync(result.AccessToken);
-            await AuthenticationStateProvider.SetTokenAsync(result.AccessToken);
+
+            await InvokeAsync(StateHasChanged);
         }
         catch (Exception e)
         {

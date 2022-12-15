@@ -32,73 +32,140 @@ public class TokenServerAuthenticationStateProvider :
     AuthenticationStateProvider, IAccessTokenProvider
 {
     private readonly IJSRuntime _jsRuntime;
+        private readonly IConfiguration Configuration;
 
-    public TokenServerAuthenticationStateProvider(IJSRuntime jsRuntime)
-    {
-        _jsRuntime = jsRuntime;
-    }
-
-    public async Task<string> GetTokenAsync()
-    {
-        return await _jsRuntime.InvokeAsync<string>("localStorage.getItem", "authToken");
-    }
-
-    public async Task SetTokenAsync(string token)
-    {
-        if (token == null)
+        public TokenServerAuthenticationStateProvider(IJSRuntime jsRuntime, IConfiguration configuration)
         {
-            await _jsRuntime.InvokeAsync<object>("localStorage.removeItem", "authToken");
-        }
-        else
-        {
-            await _jsRuntime.InvokeAsync<object>("localStorage.setItem", "authToken", token);
+            _jsRuntime = jsRuntime;
+            Configuration = configuration;
         }
 
-        NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
-    }
-
-    public async override Task<AuthenticationState> GetAuthenticationStateAsync()
-    {
-        var token = await GetTokenAsync();
-        var identity = string.IsNullOrEmpty(token)
-            ? new ClaimsIdentity()
-            : new ClaimsIdentity(ParseClaimsFromJwt(token), "jwt");
-        return new AuthenticationState(new ClaimsPrincipal(identity));
-    }
-
-    public async ValueTask<AccessTokenResult> RequestAccessToken()
-    {
-        var token = new AccessToken() { Value = await GetTokenAsync() };
-        return new AccessTokenResult(AccessTokenResultStatus.Success,token , null);
-    }
-
-    public ValueTask<AccessTokenResult> RequestAccessToken(AccessTokenRequestOptions options)
-    {
-        throw new System.NotImplementedException();
-    }
-
-    private  IEnumerable<Claim> ParseClaimsFromJwt(string jwt)
-    {
-        var payload = jwt.Split('.')[1];
-        var jsonBytes = ParseBase64WithoutPadding(payload);
-        var keyValuePairs = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonBytes);
-        return keyValuePairs.Select(kvp => new Claim(kvp.Key, kvp.Value.ToString() ?? string.Empty));
-    }
-
-    private byte[] ParseBase64WithoutPadding(string base64)
-    {
-        switch (base64.Length % 4)
+        public async Task<string> GetTokenAsync()
         {
-            case 2:
-                base64 += "==";
-                break;
-            case 3:
-                base64 += "=";
-                break;
+            var token = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", "authToken");
+            if (String.IsNullOrEmpty(token))
+                return token;
+            
+            //check if token is expired from exp value
+            if (!CheckTokenIsValid(token))
+            {
+                token = await GetAccessTokenFromRefreshToken(await GetRefreshTokenAsync());
+            }
+            
+            return token;
         }
 
-        return Convert.FromBase64String(base64);
-    }
+        public async Task SetTokenAsync(string token, string refreshToken)
+        {
+            if (token == null)
+            {
+                await _jsRuntime.InvokeAsync<object>("localStorage.removeItem", "authToken");
+                await _jsRuntime.InvokeAsync<object>("localStorage.removeItem", "refreshToken");
+            }
+            else
+            {
+                await _jsRuntime.InvokeAsync<object>("localStorage.setItem", "authToken", token);
+                await _jsRuntime.InvokeAsync<object>("localStorage.setItem", "refreshToken", refreshToken);
+            }
+
+            NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
+        }
+
+        public async Task<string> GetRefreshTokenAsync()
+        {
+            return await _jsRuntime.InvokeAsync<string>("localStorage.getItem", "refreshToken");
+        }
+
+
+
+        public async override Task<AuthenticationState> GetAuthenticationStateAsync()
+        {
+            var token = await GetTokenAsync();
+            if (String.IsNullOrEmpty(token))
+            {
+                return new AuthenticationState(new ClaimsPrincipal(new ClaimsIdentity()));
+            }
+
+            var identity = new ClaimsIdentity(ParseClaimsFromJwt(token), "jwt");
+            return new AuthenticationState(new ClaimsPrincipal(identity));
+        }
+
+        public async Task<string> GetAccessTokenFromRefreshToken(string refreshToken)
+        {
+            if (String.IsNullOrEmpty(refreshToken))
+                return null;
+            
+            var httpClient = new HttpClient();
+            var tokenResult = await httpClient.RequestRefreshTokenAsync(new RefreshTokenRequest()
+            {
+                Address = Configuration["AuthServer:Authority"].EnsureEndsWith('/') + "connect/token",
+                Scope = Configuration["AuthServer:Scope"],
+                ClientId = Configuration["AuthServer:ClientId"],
+                //ClientSecret = Configuration["AuthServer:ClientSecret"],
+                RefreshToken = refreshToken
+            });
+            await SetTokenAsync(tokenResult.AccessToken, tokenResult.RefreshToken);
+            return tokenResult.AccessToken;
+        }
+
+         
+
+        public async ValueTask<AccessTokenResult> RequestAccessToken()
+        {
+            var token = new AccessToken() { Value = await GetTokenAsync() };
+            return new AccessTokenResult(AccessTokenResultStatus.Success, token, null);
+        }
+
+        public async ValueTask<AccessTokenResult> RequestAccessToken(AccessTokenRequestOptions options)
+        {
+            var token = new AccessToken() { Value = await GetTokenAsync() };
+            return new AccessTokenResult(AccessTokenResultStatus.Success, token, null);
+            //throw new System.NotImplementedException();
+        }
+
+        public long GetTokenExpirationTime(string token)
+        {
+            var claims = ParseClaimsFromJwt(token);
+            var tokenExp = claims.First(claim => claim.Type.Equals("exp")).Value;
+            var ticks = long.Parse(tokenExp);
+            return ticks;
+        }
+
+        public bool CheckTokenIsValid(string token)
+        {
+            var tokenTicks = GetTokenExpirationTime(token);
+            var tokenDate = DateTimeOffset.FromUnixTimeSeconds(tokenTicks).UtcDateTime;
+
+            var now = DateTime.UtcNow.ToUniversalTime();
+
+            var valid = tokenDate >= now;
+
+            return valid;
+        }
+
+
+        private IEnumerable<Claim> ParseClaimsFromJwt(string jwt)
+        {
+            var payload = jwt.Split('.')[1];
+            var jsonBytes = ParseBase64WithoutPadding(payload);
+            var keyValuePairs = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonBytes);
+            return keyValuePairs.Select(kvp => new Claim(kvp.Key, kvp.Value.ToString() ?? string.Empty));
+        }
+
+        private byte[] ParseBase64WithoutPadding(string base64)
+        {
+            switch (base64.Length % 4)
+            {
+                case 2:
+                    base64 += "==";
+                    break;
+                case 3:
+                    base64 += "=";
+                    break;
+            }
+
+            return Convert.FromBase64String(base64);
+        }
 }                
 
 [DependsOn(
